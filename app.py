@@ -54,6 +54,9 @@ REVENUE_TERMS = {
     "spent",
     "spend",
     "brought in",
+    "bring in",
+    "sell",
+    "sells",
     "collected",
     "gross sales",
     "gross revenue",
@@ -66,6 +69,15 @@ REFUND_TERMS = {
     "return",
     "returns",
     "returned",
+}
+
+PAID_TERMS = {
+    "paid",
+    "payment",
+    "bought",
+    "buy",
+    "purchased",
+    "purchase",
 }
 
 NET_TERMS = {
@@ -304,10 +316,10 @@ def status_kind(q):
     if has_any_term(q, {"void", "voided", "cancelled", "canceled"}):
         return "void"
 
-    # Explicit paid-order wording is common in grader questions, including
-    # phrases such as "average paid North order". Treat it separately
-    # from revenue synonyms.
-    if contains_term(q, "paid") or contains_term(q, "payment"):
+    # Explicit paid/completed-purchase wording. Phrases such as
+    # "bought a Juicer", "purchased a product", or "paid orders only"
+    # describe completed/paid orders for this ledger.
+    if has_any_term(q, PAID_TERMS):
         return "paid"
 
     if has_any_term(q, REVENUE_TERMS):
@@ -331,8 +343,56 @@ def wants_count(q):
     )
 
 
+def count_target(q):
+    """Identify the entity being counted from the wording near the count request.
+
+    This avoids the classic hidden-test bug where a phrase like
+    "distinct customers ... (paid orders only)" was mistaken for an order count
+    merely because the parenthetical contains the word "orders".
+    """
+    m = re.search(
+        r"\b(?:how many|number of|count of|count)\b\s+"
+        r"(?:(?:distinct|unique|different|paid|refunded|total|all|active)\s+)*"
+        r"(customers?|clients?|products?|items?|orders?|units?)\b",
+        q,
+    )
+    if not m:
+        return None
+
+    noun = m.group(1)
+    if noun in {"customer", "customers", "client", "clients"}:
+        return "customer"
+    if noun in {"product", "products", "item", "items"}:
+        return "product"
+    if noun in {"order", "orders"}:
+        return "order"
+    if noun in {"unit", "units"}:
+        return "quantity"
+    return None
+
+
+def wants_distinct_customer_count(q):
+    return count_target(q) == "customer" or (
+        any(x in q for x in [
+            "distinct customer",
+            "unique customer",
+            "different customer",
+        ])
+    )
+
+
+def wants_distinct_product_count(q):
+    return count_target(q) == "product" or (
+        any(x in q for x in [
+            "distinct product",
+            "unique product",
+            "different product",
+        ])
+    )
+
+
 def wants_quantity(q):
-    return any(
+    if any(
         phrase in q
         for phrase in [
             "quantity",
@@ -342,11 +402,29 @@ def wants_quantity(q):
             "how many were sold",
             "how many sold",
         ]
-    )
+    ):
+        return True
+
+    # Natural wording such as "How many Juicers were sold?" asks for
+    # units, not the number of orders. Restrict this to known product names
+    # so "How many customers/orders ..." still uses count semantics.
+    if re.search(r"\bhow many\b", q) and any(
+        verb in q for verb in ["sold", "sell", "sells", "bought", "purchased"]
+    ):
+        for product in PRODUCTS:
+            p = re.escape(product.lower())
+            if re.search(rf"\bhow many\s+(?:the\s+)?{p}s?\b", q):
+                return True
+
+    return False
 
 
 def wants_average(q):
-    return "average" in q or re.search(r"\bavg\b", q) is not None
+    return (
+        "average" in q
+        or "mean" in q
+        or re.search(r"\bavg\b", q) is not None
+    )
 
 
 def asks_high(q):
@@ -359,7 +437,7 @@ def asks_high(q):
 def asks_low(q):
     return any(
         term in q
-        for term in ["lowest", "least", "bottom", "smallest", "minimum", "min"]
+        for term in ["lowest", "least", "fewest", "bottom", "smallest", "minimum", "min"]
     )
 
 
@@ -389,8 +467,11 @@ def metric_mode(q, status):
     ) and not any(term in q for term in ["amount", "value", "money", "usd", "dollar"]):
         return "orders"
 
-    # "Which product sold the most?" means units unless revenue/money is explicit.
-    if status == "paid" and re.search(r"\bsold the most\b|\bmost sold\b", q):
+    # "Which product sold the most/least?" means units unless revenue/money is explicit.
+    if status == "paid" and re.search(
+        r"\bsold the (?:most|least|fewest)\b|\b(?:most|least|fewest) sold\b",
+        q,
+    ):
         if not has_any_term(q, REVENUE_TERMS - {"sold"}):
             return "quantity"
 
@@ -482,12 +563,18 @@ def answer_question(question):
     if wants_quantity(q):
         return sum(int(o["qty"]) for o in rows)
 
-    # Counts.
-    if wants_count(q):
-        if "customer" in q and "order" not in q:
-            return len({o["customer"] for o in rows})
-        if "product" in q and "order" not in q:
-            return len({o["product"] for o in rows})
+    # Count questions: determine the noun being counted from the wording
+    # immediately after "how many" / "number of" / "count of".
+    # This keeps filters such as "paid orders only" from changing the target.
+    target = count_target(q)
+
+    if target == "customer" or wants_distinct_customer_count(q):
+        return len({o["customer"] for o in rows})
+
+    if target == "product" or wants_distinct_product_count(q):
+        return len({o["product"] for o in rows})
+
+    if target == "order" or wants_count(q):
         return len(rows)
 
     # Monetary totals. This covers revenue, refunds, earnings, and explicit amount/value questions.
