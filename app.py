@@ -139,6 +139,9 @@ def answer_question(question):
 
     rows = detect_filters(q)
     is_refund = any(x in q for x in ["refund", "refunded"])
+    is_revenue = any(x in q for x in [
+        "revenue", "sales", "sold", "income", "turnover", "spend", "spent"
+    ])
 
     # Leaderboard / "which" questions.
     asks_which = any(x in q for x in ["which ", "what product", "what customer", "who "])
